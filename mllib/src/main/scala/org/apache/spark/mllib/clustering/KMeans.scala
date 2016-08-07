@@ -28,6 +28,8 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.Utils
 import org.apache.spark.util.random.XORShiftRandom
+import org.apache.spark.TaskContext
+
 
 /**
  * K-means clustering with support for multiple parallel runs and a k-means++ like initialization
@@ -46,6 +48,7 @@ class KMeans private (
     private var initializationSteps: Int,
     private var epsilon: Double,
     private var seed: Long) extends Serializable with Logging {
+    var isFixedIterations: Boolean = false;
 
   /**
    * Constructs a KMeans instance with default parameters: {k: 2, maxIterations: 20, runs: 1,
@@ -84,6 +87,12 @@ class KMeans private (
     this
   }
 
+  def setFixedIterations(isFixedIterations: Boolean): this.type = {
+    this.isFixedIterations = isFixedIterations;
+    this
+  }
+
+  def getFixedIterations: Boolean = isFixedIterations
   /**
    * The initialization algorithm. This can be either "random" or "k-means||".
    */
@@ -256,34 +265,46 @@ class KMeans private (
 
     val active = Array.fill(numRuns)(true)
     val costs = Array.fill(numRuns)(0.0)
-
     var activeRuns = new ArrayBuffer[Int] ++ (0 until numRuns)
     var iteration = 0
 
     val iterationStartTime = System.nanoTime()
 
     // Execute iterations of Lloyd's algorithm until all runs have converged
-    while (iteration < maxIterations && !activeRuns.isEmpty) {
-      type WeightedPoint = (Vector, Long)
+    var activeCheck: Boolean = !activeRuns.isEmpty;
+
+    if (isFixedIterations){
+      activeCheck = true;
+    }
+    var timeSums: scala.collection.mutable.Map[Int, Long] = scala.
+      collection.mutable.Map[Int, Long]()
+
+    while (iteration < maxIterations && activeCheck) {
+      type WeightedPoint = (Vector, Long, List[(Int, Long)])
       def mergeContribs(x: WeightedPoint, y: WeightedPoint): WeightedPoint = {
         axpy(1.0, x._1, y._1)
-        (y._1, x._2 + y._2)
+        (y._1, x._2 + y._2, x._3 ::: y._3)
       }
 
       val activeCenters = activeRuns.map(r => centers(r)).toArray
       val costAccums = activeRuns.map(_ => sc.accumulator(0.0))
 
+
       val bcActiveCenters = sc.broadcast(activeCenters)
 
       // Find the sum and count of points mapping to each center
       val totalContribs = data.mapPartitions { points =>
+        val ctx = TaskContext.get();
+        val mapid = ctx.partitionId();
+          logInfo(s"Map taskId: $mapid." + s"point count : ${points.length}")
+        val starttime: Long = System.currentTimeMillis();
         val thisActiveCenters = bcActiveCenters.value
         val runs = thisActiveCenters.length
         val k = thisActiveCenters(0).length
         val dims = thisActiveCenters(0)(0).vector.size
 
         val sums = Array.fill(runs, k)(Vectors.zeros(dims))
-        val counts = Array.fill(runs, k)(0L)
+        val counts = Array.fill (runs, k)(0L)
 
         points.foreach { point =>
           (0 until runs).foreach { i =>
@@ -294,10 +315,13 @@ class KMeans private (
             counts(i)(bestCenter) += 1
           }
         }
+        val endtime: Long = System.currentTimeMillis();
+        val time = List((mapid, (endtime - starttime)));
 
         val contribs = for (i <- 0 until runs; j <- 0 until k) yield {
-          ((i, j), (sums(i)(j), counts(i)(j)))
+          ((i, j), (sums(i)(j), counts(i)(j), time))
         }
+
         contribs.iterator
       }.reduceByKey(mergeContribs).collectAsMap()
 
@@ -308,7 +332,7 @@ class KMeans private (
         var changed = false
         var j = 0
         while (j < k) {
-          val (sum, count) = totalContribs((i, j))
+          val (sum, count, time) = totalContribs((i, j))
           if (count != 0) {
             scal(1.0 / count, sum)
             val newCenter = new VectorWithNorm(sum)
@@ -317,15 +341,30 @@ class KMeans private (
             }
             centers(run)(j) = newCenter
           }
+          if (i ==0 && j == 0) {
+            time.foreach( t => {
+            val (id: Int, singletime: Long) = t
+            if (timeSums.contains(id)){
+              var temptime = timeSums(id);
+              timeSums(id) = temptime + singletime
+            } else {
+              timeSums += (id -> singletime)
+            }})
+
+            logInfo(s"Length Of Times: ${time.length}.")
+            time.foreach(s => logInfo(s"times $s."))
+          }
           j += 1
         }
-        if (!changed) {
-          active(run) = false
-          logInfo("Run " + run + " finished in " + (iteration + 1) + " iterations")
-        }
-        costs(run) = costAccums(i).value
       }
 
+      var mintime = timeSums.values.min/maxIterations;
+      var maxtime = timeSums.values.max/maxIterations;
+      var average = timeSums.values.sum.toDouble/(maxIterations * timeSums.values.size)
+
+      logInfo(s"Min Run Time: $mintime.")
+      logInfo(s"Max Run Time: $maxtime.")
+      logInfo(s"Average Run Time: $average.")
       activeRuns = activeRuns.filter(active(_))
       iteration += 1
     }
